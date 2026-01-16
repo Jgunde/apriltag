@@ -8,6 +8,8 @@
 #include <structmember.h>
 #include <numpy/arrayobject.h>
 #include <signal.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "apriltag.h"
 #include "apriltag_pose.h"
@@ -35,8 +37,11 @@
 
 #define TAG_CREATE_FAMILY(name) \
     else if (0 == strcmp(family, #name)) self->tf = name ## _create();
-#define TAG_SET_DESTROY_FUNC(name) \
-    else if (0 == strcmp(family, #name)) self->destroy_func = name ## _destroy;
+#define TAG_CREATE_FAMILY_AND_DESTROY(name) \
+    else if (0 == strcmp(family, #name)) { \
+        *tf = name ## _create(); \
+        *destroy_func = name ## _destroy; \
+    }
 #define FAMILY_STRING(name) "  " #name "\n"
 
 
@@ -70,11 +75,43 @@ do {                                                                    \
 typedef struct {
     PyObject_HEAD
 
-    apriltag_family_t*   tf;
-    apriltag_detector_t* td;
-    PyThread_type_lock   det_lock;
-    void (*destroy_func)(apriltag_family_t *tf);
+    apriltag_family_t**   tfs;
+    void (**destroy_funcs)(apriltag_family_t *tf);
+    char**                family_names;
+    int                   tf_count;
+    apriltag_detector_t*  td;
+    PyThread_type_lock    det_lock;
 } apriltag_py_t;
+
+static bool apriltag_family_create(const char* family,
+                                   apriltag_family_t** tf,
+                                   void (**destroy_func)(apriltag_family_t *tf))
+{
+    if(0) ; SUPPORTED_TAG_FAMILIES(TAG_CREATE_FAMILY_AND_DESTROY)
+    else
+        return false;
+
+    if(*tf == NULL || *destroy_func == NULL)
+        return false;
+
+    return true;
+}
+
+static apriltag_family_t* apriltag_family_from_name(apriltag_py_t* self,
+                                                    const char* family)
+{
+    if(self == NULL || family == NULL)
+        return NULL;
+
+    for(int i = 0; i < self->tf_count; i++)
+    {
+        if(self->family_names[i] != NULL &&
+           0 == strcmp(self->family_names[i], family))
+            return self->tfs[i];
+    }
+
+    return NULL;
+}
 
 
 static PyObject *
@@ -87,7 +124,10 @@ apriltag_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
     apriltag_py_t* self = (apriltag_py_t*)type->tp_alloc(type, 0);
     if(self == NULL) goto done;
 
-    self->tf = NULL;
+    self->tfs = NULL;
+    self->destroy_funcs = NULL;
+    self->family_names = NULL;
+    self->tf_count = 0;
     self->td = NULL;
 
     self->det_lock = PyThread_allocate_lock();
@@ -96,7 +136,7 @@ apriltag_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
         goto done;
     }
 
-    const char* family          = NULL;
+    PyObject*   family_obj      = NULL;
     int         Nthreads        = 1;
     int         maxhamming      = 1;
     float       decimate        = 2.0;
@@ -115,9 +155,9 @@ apriltag_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
                         "debug",
                         NULL };
 
-    if(!PyArg_ParseTupleAndKeywords( args, kwargs, "s|iiffOO",
+    if(!PyArg_ParseTupleAndKeywords( args, kwargs, "O|iiffOO",
                                      keywords,
-                                     &family,
+                                     &family_obj,
                                      &Nthreads,
                                      &maxhamming,
                                      &decimate,
@@ -133,16 +173,94 @@ apriltag_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
     if(py_debug        != NULL)
         debug        = PyObject_IsTrue(py_debug);
 
-
-    if(0) ; SUPPORTED_TAG_FAMILIES(TAG_SET_DESTROY_FUNC)
+    PyObject* family_seq = NULL;
+    if(PyUnicode_Check(family_obj) || PyBytes_Check(family_obj))
+    {
+        family_seq = NULL;
+        self->tf_count = 1;
+    }
+    else if(PyList_Check(family_obj) || PyTuple_Check(family_obj))
+    {
+        family_seq = family_obj;
+        self->tf_count = (int)PySequence_Size(family_seq);
+    }
     else
     {
-        PyErr_Format(PyExc_RuntimeError, "Unrecognized tag family name: '%s'. Families I know about:\n%s",
-                     family, SUPPORTED_TAG_FAMILIES(FAMILY_STRING));
+        PyErr_SetString(PyExc_TypeError,
+                        "family must be a string or a list/tuple of strings");
         goto done;
     }
 
-    if(0) ; SUPPORTED_TAG_FAMILIES(TAG_CREATE_FAMILY);
+    if(self->tf_count <= 0)
+    {
+        PyErr_SetString(PyExc_RuntimeError, "At least one tag family must be provided");
+        goto done;
+    }
+
+    self->tfs = PyMem_Calloc(self->tf_count, sizeof(apriltag_family_t*));
+    self->destroy_funcs = PyMem_Calloc(self->tf_count,
+                                       sizeof(void (*)(apriltag_family_t*)));
+    self->family_names = PyMem_Calloc(self->tf_count, sizeof(char*));
+    if(self->tfs == NULL || self->destroy_funcs == NULL || self->family_names == NULL)
+    {
+        PyErr_SetString(PyExc_RuntimeError, "Unable to allocate tag family storage");
+        goto done;
+    }
+
+    for(int i = 0; i < self->tf_count; i++)
+    {
+        bool owns_item = family_seq != NULL;
+        PyObject* item = family_seq ? PySequence_GetItem(family_seq, i) : family_obj;
+        if(item == NULL)
+        {
+            PyErr_SetString(PyExc_RuntimeError, "Unable to read tag family");
+            goto done;
+        }
+
+        if(!(PyUnicode_Check(item) || PyBytes_Check(item)))
+        {
+            PyErr_SetString(PyExc_TypeError,
+                            "family list entries must be strings");
+            if(owns_item)
+                Py_DECREF(item);
+            goto done;
+        }
+
+        const char* family = PyUnicode_Check(item) ? PyUnicode_AsUTF8(item)
+                                                   : PyBytes_AsString(item);
+        if(family == NULL)
+        {
+            if(owns_item)
+                Py_DECREF(item);
+            goto done;
+        }
+
+        apriltag_family_t* tf = NULL;
+        void (*destroy_func)(apriltag_family_t *tf) = NULL;
+        if(!apriltag_family_create(family, &tf, &destroy_func))
+        {
+            PyErr_Format(PyExc_RuntimeError,
+                         "Unrecognized tag family name: '%s'. Families I know about:\n%s",
+                         family, SUPPORTED_TAG_FAMILIES(FAMILY_STRING));
+            if(owns_item)
+                Py_DECREF(item);
+            goto done;
+        }
+
+        self->tfs[i] = tf;
+        self->destroy_funcs[i] = destroy_func;
+        self->family_names[i] = strdup(family);
+        if(self->family_names[i] == NULL)
+        {
+            PyErr_SetString(PyExc_RuntimeError, "Unable to copy tag family name");
+            if(owns_item)
+                Py_DECREF(item);
+            goto done;
+        }
+
+        if(owns_item)
+            Py_DECREF(item);
+    }
 
     self->td = apriltag_detector_create();
     if(self->td == NULL)
@@ -151,7 +269,8 @@ apriltag_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
         goto done;
     }
 
-    apriltag_detector_add_family_bits(self->td, self->tf, maxhamming);
+    for(int i = 0; i < self->tf_count; i++)
+        apriltag_detector_add_family_bits(self->td, self->tfs[i], maxhamming);
     self->td->quad_decimate       = decimate;
     self->td->quad_sigma          = blur;
     self->td->nthreads            = Nthreads;
@@ -179,10 +298,28 @@ apriltag_new(PyTypeObject *type, PyObject *args, PyObject *kwargs)
                 apriltag_detector_destroy(self->td);
                 self->td = NULL;
             }
-            if(self->tf != NULL)
+            if(self->tfs != NULL)
             {
-                self->destroy_func(self->tf);
-                self->tf = NULL;
+                for(int i = 0; i < self->tf_count; i++)
+                {
+                    if(self->tfs[i] != NULL)
+                        self->destroy_funcs[i](self->tfs[i]);
+                    self->tfs[i] = NULL;
+                }
+                PyMem_Free(self->tfs);
+                self->tfs = NULL;
+            }
+            if(self->destroy_funcs != NULL)
+            {
+                PyMem_Free(self->destroy_funcs);
+                self->destroy_funcs = NULL;
+            }
+            if(self->family_names != NULL)
+            {
+                for(int i = 0; i < self->tf_count; i++)
+                    free(self->family_names[i]);
+                PyMem_Free(self->family_names);
+                self->family_names = NULL;
             }
             if(self->det_lock != NULL)
             {
@@ -206,10 +343,28 @@ static void apriltag_dealloc(apriltag_py_t* self)
         apriltag_detector_destroy(self->td);
         self->td = NULL;
     }
-    if(self->tf != NULL)
+    if(self->tfs != NULL)
     {
-        self->destroy_func(self->tf);
-        self->tf = NULL;
+        for(int i = 0; i < self->tf_count; i++)
+        {
+            if(self->tfs[i] != NULL)
+                self->destroy_funcs[i](self->tfs[i]);
+            self->tfs[i] = NULL;
+        }
+        PyMem_Free(self->tfs);
+        self->tfs = NULL;
+    }
+    if(self->destroy_funcs != NULL)
+    {
+        PyMem_Free(self->destroy_funcs);
+        self->destroy_funcs = NULL;
+    }
+    if(self->family_names != NULL)
+    {
+        for(int i = 0; i < self->tf_count; i++)
+            free(self->family_names[i]);
+        PyMem_Free(self->family_names);
+        self->family_names = NULL;
     }
     if(self->det_lock != NULL)
     {
@@ -332,7 +487,8 @@ static PyObject* apriltag_detect(apriltag_py_t* self,
         }
 
         PyTuple_SET_ITEM(detections_tuple, i,
-                         Py_BuildValue("{s:i,s:f,s:i,s:N,s:N,s:N}",
+                         Py_BuildValue("{s:s,s:i,s:f,s:i,s:N,s:N,s:N}",
+                                       "family", det->family->name,
                                        "hamming", det->hamming,
                                        "margin",  det->decision_margin,
                                        "id",      det->id,
@@ -399,7 +555,41 @@ static PyObject* apriltag_estimate_tag_pose(apriltag_py_t* self,
 
     // Create a temporary detection structure
     apriltag_detection_t det;
-    det.family = self->tf;
+    apriltag_family_t* family = NULL;
+    PyObject* py_family = PyDict_GetItemString(detection_dict, "family");
+    if(py_family != NULL)
+    {
+        if(!PyUnicode_Check(py_family))
+        {
+            PyErr_SetString(PyExc_TypeError,
+                            "Detection 'family' field must be a string");
+            return NULL;
+        }
+        const char* family_name = PyUnicode_AsUTF8(py_family);
+        if(family_name == NULL)
+            return NULL;
+
+        family = apriltag_family_from_name(self, family_name);
+        if(family == NULL)
+        {
+            PyErr_Format(PyExc_RuntimeError,
+                         "Unrecognized tag family name: '%s'. Families I know about:\n%s",
+                         family_name, SUPPORTED_TAG_FAMILIES(FAMILY_STRING));
+            return NULL;
+        }
+    }
+    else if(self->tf_count == 1)
+    {
+        family = self->tfs[0];
+    }
+    else
+    {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "Detection dictionary is missing 'family' field for multi-family detector");
+        return NULL;
+    }
+
+    det.family = family;
     det.id = PyLong_AsLong(py_id);
     det.hamming = PyLong_AsLong(py_hamming);
     det.decision_margin = PyFloat_AsDouble(py_margin);

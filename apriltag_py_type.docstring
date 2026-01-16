@@ -39,10 +39,12 @@ run the detector you
 
 The constructor takes a number of arguments:
 
-- family: a string for the tag type we're detecting. This argument is required.
+- family: a string for the tag type we're detecting, or a list/tuple of strings
+  to detect multiple families with a single detector. This argument is required.
   If an invalid string is given, the known list of tag families will be
   reported. At the time of this writing the known families are:
 
+  - "tag36h10"
   - "tag36h11"
   - "tag25h9"
   - "tag16h5"

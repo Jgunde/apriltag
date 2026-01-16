@@ -38,7 +38,8 @@ ARGUMENTS
 
 - detection: A dictionary containing detection information returned by the
   detect() method. This dictionary must include the 'homography' key with the
-  3x3 homography matrix.
+  3x3 homography matrix. If the detector was constructed with multiple tag
+  families, the dictionary must also include the 'family' key.
 
 - tagsize: The physical side length of the AprilTag in meters. This is the real-
   world size of the tag, which is necessary for computing the scale of the pose.
