@@ -42,6 +42,8 @@ a tuple containing the detections. Each detection is a dict with keys:
 
 - id: integer identifying each detected tag
 
+- family: the detected tag family name
+
 - center: pixel coordinates of the center of each detection.  NOTE: Please be
   cautious regarding the image coordinate convention. Here, we define (0,0) as
   the left-top corner (not the center point) of the left-top-most pixel.
